@@ -1,0 +1,1326 @@
+======================================================================
+W26 / Lua VM DAMAGE CONTROL GUIDE
+======================================================================
+
+Version: 2.0 (updated after practical experience with game update)
+Purpose: provide a COMPLETE and REPEATABLE guide for:
+  - recognizing games with Lua-VM-like architecture (including custom 5.3/5.4);
+  - reverse engineering bytecode (W26 analogs) and Proto structure;
+  - locating damage formula and HP delta recording;
+  - designing and testing robust W26 patches;
+  - porting these patches to runtime (Frida + Proto loader hook);
+  - maintaining patches during game updates (analysis of all typical breakages).
+
+======================================================================
+PRACTICAL GUIDE: GAME UPDATE (REAL CASE CHRONOLOGY)
+======================================================================
+
+IMPORTANT: This section is based on REAL experience updating BLEACH: Soul Resonance.
+All steps have been tested in practice and should be used as a reference for future updates.
+
+----------------------------------------------------------------------
+STEP 1: DIAGNOSING THE PROBLEM AFTER UPDATE
+----------------------------------------------------------------------
+
+Symptoms:
+  - Patches are applied (logs show "✓ PATCHED"), but damage does NOT change
+  - Or patches are not applied at all (no matches by codeSize/constCount)
+
+What happened in the real case:
+  1. Old P10: codeSize=577, constCount=68, MULK C=59 at PC 461 and 546
+  2. New P10: codeSize=648, constCount=71, MULK C=60 at PC 481 and 600
+  3. TValue format changed: type for float is no longer 19 (became 123, 45, etc.)
+  4. k[14] was not read as float, so k[14] patch was not applied
+
+Actions:
+  1. Run Frida script with logging
+  2. Check logs: is there "HIT Proto" or only "POTENTIAL MATCH"
+  3. If no matches - Proto sizes have changed
+
+----------------------------------------------------------------------
+STEP 2: CREATING PROTO DUMPS FOR ANALYSIS
+----------------------------------------------------------------------
+
+Goal: Get raw code[] data for all suspicious Proto.
+
+Method:
+  1. Frida script already has dumpProtoForAnalysis() function
+  2. It automatically dumps Proto with sizes close to old P10
+  3. Dumps are saved in work/proto_dumps/*.code.bin
+
+Dump format:
+  - Filename: proto_<codeSize>_<constCount>_<sourceName>_<index>.code.bin
+  - Contents: array of 32-bit words (Proto code[] array)
+  - Size: codeSize * 4 bytes
+
+Dump analysis:
+  python work/full_p10_analysis.py
+  
+  Script searches for:
+  - MULK with C=60 (new constant 0.0001)
+  - MULK with C=59 (old constant 0.0001)
+  - MULK distribution by constant indices
+
+Analysis result:
+  - Found candidate: proto_648_71 with MULK C=60 at PC 481 and 600
+  - This is the new P10!
+
+----------------------------------------------------------------------
+STEP 3: CREATING FULL LUA CHUNK DUMP
+----------------------------------------------------------------------
+
+Goal: Get full Lua chunk for deep analysis of all Proto inside.
+
+Method:
+  1. Frida script has luaL_loadbufferx hook
+  2. It dumps combat/api/damageFunc.lua when loaded
+  3. Dump is saved in work/lua_dumps/bleach_lua_<id>_combat_api_damageFunc.lua_NEW.bin
+
+Full dump analysis:
+  python work/analyze_damage_func_full.py
+  
+  Script:
+  - Parses all Proto in chunk
+  - Searches for Proto with damage strings (DamageData, GetDamageFactor, CRITRATE_CONST, etc.)
+  - Searches for MULK C=60 in code[] of each Proto
+  - Finds P11 (648/71) with damage strings AND MULK C=60 - this is definitely P10!
+
+Result:
+  - Confirmed: P11 (648/71) is the damage formula
+  - Contains strings: DamageData, GetDamageFactor, DamageRandom, CRITRATE_CONST, GetDef
+  - Contains MULK C=60 at PC 481 and 600
+
+----------------------------------------------------------------------
+STEP 4: UPDATING PATCHES IN FRIDA SCRIPT
+----------------------------------------------------------------------
+
+What needs to be updated in W26_PATCH_SETS:
+
+1. Add new patch set:
+   {
+       codeSize: 648,
+       constCount: 71,
+       protoTag: "P10_NEW",
+       patches: [
+           { pc: 481, old: 0x3C101718, neu: 0x0E101718 }, // MULK C=60 -> C=14
+           { pc: 600, old: 0x3C102418, neu: 0x0E102418 }, // MULK C=60 -> C=14
+       ],
+   }
+
+2. Update k[14] patching:
+   - Old code checked type === 19 (float)
+   - New format: type can be 123, 45, etc.
+   - SOLUTION: Read double directly WITHOUT type check (as in guide, line 462)
+   - entry.readDouble() and entry.writeDouble() - without type check!
+
+3. Important: MULK patches work, k[14] patch may not work due to TValue format
+   - If k[14] doesn't patch - that's normal, MULK patches are sufficient
+
+----------------------------------------------------------------------
+STEP 5: TESTING AND VERIFICATION
+----------------------------------------------------------------------
+
+1. Run Frida script:
+   python work/run_frida_js.py --script work/lua_w26_proto_patch.js --package com.bleach.apj --attach
+
+2. Check logs:
+   - Should see: "[W26] ✓✓✓ HIT Proto P10_NEW"
+   - Should see: "[W26] patched P10_NEW pc=481 ..."
+   - Should see: "[W26] patched P10_NEW pc=600 ..."
+   - May see: "[W26] failed to patch k[14]" - this is normal if TValue format changed
+
+3. Check damage in game:
+   - If damage increased - patches work!
+   - If damage didn't change - need to find different Proto or different patching method
+
+----------------------------------------------------------------------
+STEP 6: WHAT TO DO IF PATCHES DON'T WORK
+----------------------------------------------------------------------
+
+Problem 1: Patches are applied but damage doesn't change
+  Solution:
+  - Check that this is the correct Proto (by damage strings)
+  - Check that MULK patches are correct (C=60 -> C=14)
+  - Try patching k[60] instead of k[14] (new constant)
+  - Increase multiplier (0.016 -> 0.1 or more)
+
+Problem 2: TValue format changed, k[14] not readable
+  Solution:
+  - Use only MULK patches (they always work)
+  - Or find correct offset for double in new TValue format
+  - Or patch k[60] directly (new constant 0.0001)
+
+Problem 3: No Proto found with MULK C=60
+  Solution:
+  - Search for MULK with other indices (C=59, C=61, etc.)
+  - Search by damage strings in constants
+  - Analyze all Proto in combat_api_damageFunc dump
+
+----------------------------------------------------------------------
+CHECKLIST FOR FUTURE UPDATES
+----------------------------------------------------------------------
+
+1. [ ] Run Frida script and check logs
+2. [ ] If no matches - create Proto dumps (automatically)
+3. [ ] Run full_p10_analysis.py to search for MULK C=60
+4. [ ] Create full dump of combat_api_damageFunc (enter battle)
+5. [ ] Run analyze_damage_func_full.py to search by strings
+6. [ ] Update W26_PATCH_SETS with new sizes and patches
+7. [ ] Update k[14] patching (remove type check, read double directly)
+8. [ ] Test in game
+9. [ ] If doesn't work - search for alternative patching methods
+
+----------------------------------------------------------------------
+IMPORTANT PRACTICAL CONCLUSIONS
+----------------------------------------------------------------------
+
+1. MULK patches are more stable than k[] patches
+   - MULK patches always work (change constant index)
+   - k[] patches may not work due to TValue format changes
+
+2. TValue format can change between updates
+   - Old format: type = 19 for float
+   - New format: type = 123, 45, etc. (not 19)
+   - Solution: Read double directly WITHOUT type check
+
+3. Proto sizes change, but patterns remain
+   - Old P10: 577/68, MULK C=59
+   - New P10: 648/71, MULK C=60
+   - Pattern: MULK with large constant index (59/60) - this is damage formula
+
+4. Dump analysis is critically important
+   - Without dumps it's impossible to find new P10
+   - full_p10_analysis.py finds candidates by MULK C=60
+   - analyze_damage_func_full.py confirms by damage strings
+
+5. Logging should be informative but not spam
+   - Log only important events (HIT Proto, patches)
+   - Don't log every luaL_loadbufferx (only combat/api/damageFunc)
+   - Don't log Stats every 10 seconds (only on exit)
+
+======================================================================
+MAIN SECTION (THEORY)
+======================================================================
+
+Document is divided into major parts:
+  1) Universal detector for "Lua-like VM with patchable damage"
+  2) General methodology for reverse engineering Lua-VM / Proto / bytecode
+  3) Specific case: BLEACH: Soul Resonance (W26 branch)
+  4) Designing W26 patches for damage formula
+  5) Frida layer: runtime patch of Proto->code[] and constants k[]
+  6) Game updates: how NOT to break and how to fix
+  7) Adapting methodology to other games
+
+======================================================================
+1. UNIVERSAL DETECTOR "THIS IS OUR CASE"
+======================================================================
+
+Goal of this section — provide an algorithm,
+by which you can:
+  - evaluate a new game (especially mobile, Unity/UE4, etc.);
+  - understand if it has a Lua layer with its own VM;
+  - confirm that damage formula is implemented there
+    and potentially patchable at bytecode level.
+
+----------------------------------------------------------------------
+1.1. Quick External Signs
+----------------------------------------------------------------------
+
+1) Technology Stack
+   - Game on Unity / Unreal / custom engine.
+   - Presence of bundled Lua solutions:
+       xlua, tolua#, MoonSharp, slua, custom LuaJIT, etc.
+   - In Android package pay attention to:
+       - libgame.so, liblua*.so, libxlua.so, libtolua.so, etc.
+
+2) Lua Scripts and Resources
+   - In assets / res / streamingassets search for:
+       *.lua, *.lua.txt, *.lua.bytes, *.bytes, unusual *.bin.
+   - For *.bin / *.bytes:
+       - check first bytes: is there \x1bLua, "Lua", "luac", version bytes 0x51–0x54.
+
+3) Logs and Strings
+   - In libgame.so / liblua*.so:
+       - presence of strings "luaV_execute", "luaD_pcall", "luaU_undump", "luaY_parser", etc.
+   - Presence of many strings about combat logic:
+       "Damage", "HpDelta", "HitInfo", "DamageData", "Combat", "SkillId", etc.
+
+If all this exists → very likely that:
+  - game has Lua-VM;
+  - combat damage/formulas are implemented on Lua side;
+  - we can attack this layer.
+
+----------------------------------------------------------------------
+1.2. Checking for Lua-VM in Native Code
+----------------------------------------------------------------------
+
+Steps for IDA / Ghidra / analogs:
+
+1) Open main gameplay so (in BLEACH this is libgame.so).
+2) Find strings:
+   - "luaV_execute", "luaD_rawrunprotected", "luaU_undump",
+     "luaL_loadbufferx", "lua_pcallk", "lua_gettop", etc.
+
+3) By xrefs from strings "luaV_execute"/"luaU_undump":
+   - find function that:
+       - implements main interpreter,
+         with loop reading 32-bit/64-bit words
+         and large switch/computed-goto.
+
+4) Signs of "our" VM:
+   - in loop:
+       - loading word (LDR/LDUR) from array (Proto->code).
+       - extracting opcode via AND/LSR/UBFX.
+       - then:
+           - either huge switch;
+           - or address table (disptab) + BR/BRX.
+
+5) Signs of binary loader:
+   - functions like luaU_undump / loadFunction,
+     which:
+       - read chunk header;
+       - create Proto/LClosure;
+       - read arrays code[], k[], p[], lineinfo, locvars, etc.
+
+If all this is found → formally confirmed:
+  - has own Lua-VM;
+  - has binary Lua chunks;
+  - has bytecode (W26 analog) in Proto->code[];
+  - we can theoretically:
+      - dump chunks;
+      - decode Proto;
+      - disassemble bytecode;
+      - patch damage formula.
+
+----------------------------------------------------------------------
+1.3. How to Understand that Damage Formula is in Lua-VM, not in IL2CPP/C#
+----------------------------------------------------------------------
+
+Ideal order of actions:
+
+1) IL2CPP/C# level:
+   - via dnSpy / il2cpp-dump find methods with names:
+       Damage*, Hp*, Combat*, ApplyDamage, OnHit, BattleSystem, etc.
+   - see what they do:
+       - If they only:
+           - take some parameters,
+           - form structure/table,
+           - call Lua (via xlua/tolua#/bridge),
+         then real damage formula is almost certainly in Lua script.
+
+2) Native / libgame.so:
+   - find glue functions between C#/IL2CPP and Lua
+     (in BLEACH this is Axon::luaAX_LoadLuaFile and analogs).
+   - see that combat events (hits, skills)
+     are passed to Lua (Lua function calls by name/index).
+
+3) Lua level (scripts):
+   - by strings in chunks find:
+       "Damage", "DamageData", "GetDamageValue", "OnDamage",
+       "HandleWithHpChangeInfo", "hitDamage", "HpDelta", etc.
+
+4) If all this converges:
+   - IL2CPP only passes data to Lua;
+   - VM executes script with combat functions;
+   - means, control over damage requires W26/bytecode patch.
+
+======================================================================
+2. GENERAL METHODOLOGY FOR REVERSE ENGINEERING LUA-VM / PROTO / BYTECODE
+======================================================================
+
+This section provides universal scheme, not strictly tied to BLEACH,
+but implemented there as W26 branch.
+
+Idea: always three levels:
+  - File level: binary Lua chunk (.lua.bin / .bytes, etc.)
+  - Proto level: Proto structure in memory (code[], k[], p[], debug)
+  - VM level: luaV_execute + 32-bit instruction word format
+
+----------------------------------------------------------------------
+2.1. Dumping Binary Lua Chunks
+----------------------------------------------------------------------
+
+Approach:
+  - find place where game calls luaL_loadbufferx / lua_load.
+  - insert Frida hook before/after call:
+      - intercept (buff, size, name);
+      - save bytes to file.
+
+Steps:
+
+1) In libgame.so via IDA:
+   - find Axon::luaAX_LoadLuaFile / analogs;
+   - find call to luaL_loadbufferx / lua_load.
+
+2) In Frida:
+   - hook at luaL_loadbufferx address:
+       - print chunk name (name);
+       - if name matches combat module ("damage", "combat", "system"),
+         save buffer to file: <name>.lua.bin.
+
+3) Result:
+   - directory work/lua_dumps with many *.lua.bin,
+     among them key combat modules.
+
+----------------------------------------------------------------------
+2.2. Proto Format: Recovery from luaU_undump + loadFunction
+----------------------------------------------------------------------
+
+Task:
+  - get precise Python parser for Proto,
+    matching native loadFunction.
+
+Method:
+
+1) In IDA by luaU_undump / loadFunction:
+   - mark sequence of reads from ZIO:
+       - varint fields;
+       - fixed bytes;
+       - block reads (luaZ_read).
+
+2) Recover varint:
+   value = 0
+   do:
+     b = read_u8()
+     value = (b & 0x7F) | (value << 7)
+   while (b & 0x80) == 0
+
+3) Fix order of Proto fields:
+   - source (string via loadStringN)
+   - line_defined, last_line_defined (varint x2)
+   - numparams, is_vararg, maxstack (bytes)
+   - nCode (varint) + code[] (nCode * 4 bytes)
+   - nConst (varint) + k[]
+   - nUpvalues (varint) + 3 bytes/descriptor
+   - nProto (varint) + recursive Proto
+   - nLineInfo (varint) + byte array
+   - nLocVars (varint) + 2 varint/record
+   - nUpValueNames (varint) + (string + 2 varint)
+   - extra_flag (varint) + if non-zero: strings by upvalues.
+
+4) Implement ByteReader + parse_proto in Python:
+   - clearly reproduce read sequence;
+   - any unknown fields should be correctly skipped anyway.
+
+----------------------------------------------------------------------
+2.3. Instruction Format: Parsing luaV_execute
+----------------------------------------------------------------------
+
+Task:
+  - understand how 32-bit word (W26 analog) is split into fields:
+      op, A, B, C, extended fields (Bx/sBx/extra).
+
+Approach:
+
+1) In luaV_execute:
+   - find place where from register Wxx or Xxx,
+     storing word, bits are extracted via AND/LSR/UBFX.
+
+2) By multiple uses of UBFX/LSR:
+   - derive exact scheme:
+       op = word & mask0
+       A = (word >> sh1) & mask1
+       ...
+   - in BLEACH:
+       op  = word & 0x7F
+       A   = (word >> 7)  & 0xFF
+       F   = (word >> 15) & 0x1
+       B   = (word >> 16) & 0xFF
+       C   = (word >> 24) & 0xFF
+
+3) Build auxiliary derived fields (if frequently encountered):
+   - Bx17, sBx17, off_*.
+
+4) Match op with handler table:
+   - luaV_execute.disptab: array of 128 QWORD,
+     each points to opcode handler.
+   - by handler address and its logic
+     bind numeric op to opcode name (MOVE, LOADK, CALL, JMP, EQ, etc.).
+
+----------------------------------------------------------------------
+2.4. Bytecode Disassembler
+----------------------------------------------------------------------
+
+Based on point 2.3 disassembler is implemented:
+  - input: list of 32-bit words (from Proto->code[] or from .low32.bin).
+  - for each:
+      - decode op/A/B/C/extra;
+      - match op → name (OP_NAMES);
+      - (optionally) annotate constants:
+         - LOADK → k[B];
+         - GETFIELD/SETFIELD → string keys via k[C], etc.
+
+Tools:
+  - lua_disasm_full.py — for .low32.bin streams (global X-ray).
+  - lua_disasm_from_proto.py — for specific Proto in *.lua.bin.
+
+----------------------------------------------------------------------
+2.5. Locating Combat Proto and Damage Formula
+----------------------------------------------------------------------
+
+Algorithm:
+
+1) Via Proto parser:
+   - for each Proto collect:
+       - string_consts (list of k[] strings);
+       - code_size, const_count, line_defined;
+       - (if needed) tree of nested Proto.
+
+2) Search by string_consts:
+   - function names:
+       GetDamageValue, OnDamage, HandleWithHpChangeInfo,
+       DamageFunc, DamageSystemUpdate, ConsumeHitInfo, etc.
+   - structure fields:
+       hitDamage, hitNum, HpDelta, RealDamage, DamageType,
+       DamageRandom, SkillId, EntityType, Camp, IsHostility.
+
+3) For selected Proto:
+   - via disasm scroll through code and
+     find sections:
+       - intensive arithmetic (ADD/MUL/MULK/DIVK);
+       - work with DamageData / hitInfo / damageCfg;
+       - writes to hitDamage/HpDelta/RealDamage.
+
+4) Build chain:
+   - P10 level: damage formula (DamageData → damageNumber).
+   - P4/P13 level: application to specific hits and HP delta.
+   - DamageSystem level: managing hitInfos/hitCount/ConsumeHitInfo.
+
+======================================================================
+3. CASE BLEACH: SOUL RESONANCE — W26 BRANCH
+======================================================================
+
+This section briefly documents,
+what exactly was done for BLEACH,
+so you can:
+  - replay these steps if needed;
+  - and by analogy port approach to other games.
+
+----------------------------------------------------------------------
+3.1. Key Files and Functions
+----------------------------------------------------------------------
+
+Chunk files:
+  - bleach_lua_544_combat_api_damageFunc.lua.bin
+  - bleach_lua_543_combat_system_damageSystem.lua.bin
+  - plus configs damage_cfg*.lua.bin
+
+Key Proto (by lua_undump_proto.py):
+  - In damageFunc:
+      P10: code=577, consts=68 (main damage formula)
+      P4 : code=313, consts=69 (application, shields, SP effects)
+      P13: code=154, consts=26 (hitNum/hitDamage, HeroHit/ComboHit)
+  - In damageSystem:
+      P2/P3: ConsumeHitInfo, SetDamageRandomSeed, hitInfos/hitCount.
+
+Lua-VM:
+  - luaV_execute @ 0x546660 in libgame.so
+  - luaV_execute.disptab @ 0x6E2E28 (128 QWORD, op → handler)
+
+Proto loader:
+  - luaU_undump @ 0x5435DC
+  - loadFunction @ 0x5439C4
+
+----------------------------------------------------------------------
+3.2. Tool Stack (Python Utilities)
+----------------------------------------------------------------------
+
+1) lua_bytecode_entropy_normalize.py
+   - first step: slicing 8-byte words → 4-byte lower32,
+     building *.low32.bin;
+   - in final W26 branch version serves as auxiliary.
+
+2) lua_disasm_full.py
+   - disasm of .low32.bin streams by W26 format;
+   - shows op/A/B/C/Bx/sBx/offs;
+   - main "X-ray" of bytecode.
+
+3) lua_undump_proto.py
+   - honest Proto parser by luaU_undump + loadFunction:
+       - ByteReader + varint;
+       - parse_proto with fields:
+           depth, line_defined, last_line_defined;
+           num_params, is_vararg, max_stack;
+           code_size, const_count;
+           string_consts;
+           k_types, k_values;
+           code_words, code_offset.
+
+4) lua_disasm_from_proto.py
+   - disasm of specific Proto directly from *.lua.bin:
+       - select Proto by --proto-index or --match by strings;
+       - annotation of k[] constants:
+           LOADK → k[B], GETFIELD/SETFIELD → k[C].
+
+5) lua_patch_w26.py
+   - experimental patcher for .low32.bin by global PC.
+
+6) lua_patch_proto_w26.py
+   - main offline patcher for *.lua.bin by (Proto, PC):
+       - format: P:PC=0xWORD;
+       - calculates file offset via code_offset;
+       - overwrites 4 bytes of W26 word.
+
+----------------------------------------------------------------------
+3.3. Locating Damage Formula in BLEACH
+----------------------------------------------------------------------
+
+Steps:
+
+1) By lua_undump_proto:
+   - find P10 in damageFunc:
+       - k[] strings include:
+           DamageData, DamageRandom, DamageSkillType, DamageType,
+           GetDamageFactor, GetDamageTypeAddPer, GetDamageSkillTypeAddPer,
+           GetAllDam, GetBEAllDam, CRITRATE_CONST, CRITFACTOR_CONST,
+           IsAbnormal, GetAbnormalProficiency, GetDefPenetration,
+           GetAtk, 0.01, 0.0001, math, ceil, etc.
+   - this is obvious center of all damage math.
+
+2) Via lua_disasm_from_proto (P10):
+   - in range PC ~60–250:
+       - see multiple MULK/ADD/MOD and function calls from k[];
+       - find places where constant 0.0001 (k[59]) is used → final normalizations.
+
+3) Via lua_disasm_from_proto (P13):
+   - at PC ~120–152:
+       - GETFIELD/SETFIELD by k[19]='hitNum', k[20]='hitDamage';
+       - see how final damage is placed into per-hit structure.
+
+4) Mapping:
+   - P10 gives final Damage;
+   - P13 "spreads" it across hits;
+   - P4/HP pipeline already applies HP delta/effects.
+
+----------------------------------------------------------------------
+3.4. Our Key Patch Points in BLEACH
+----------------------------------------------------------------------
+
+Chosen strategy:
+  - don't insert/delete instructions;
+  - don't change Proto structure;
+  - if possible patch only:
+      - constants/multipliers;
+      - or fields in existing instructions (C in MULK, etc.).
+
+Main P10 patches:
+
+1) Replace constant 0.0001 → 0.01 in MULK:
+   - PC 461: 0x3B0F1598 → 0x0E0F1598
+   - PC 546: 0x3B0F2298 → 0x0E0F2298
+   - semantically:
+       - instead of k[59]=0.0001 use k[14]=0.01,
+         without changing k[] as array.
+
+2) Additional runtime patch of constant k[14]:
+   - in Frida script, after identifying P10:
+       - (optionally) replace k[14] from 0.01 to huge DAMAGE_MULT (e.g. 10000).
+   - in total:
+       - instead of 0.0001 → 0.01 → 10000.0:
+           final multiplier grows by many orders of magnitude.
+
+======================================================================
+4. DESIGNING W26 PATCHES FOR DAMAGE FORMULA
+======================================================================
+
+Important principle: any W26 patch must:
+  - preserve code[] length;
+  - not break stack discipline;
+  - not violate Proto format.
+
+Typical variants:
+  - A) patch number in k[];
+  - B) patch instruction parameters (e.g., replace constant index);
+  - C) patch op itself (replace, e.g., SUB → ADD, MULK → NOP-like MOVE, etc.).
+
+----------------------------------------------------------------------
+4.1. Patching Number in k[]
+----------------------------------------------------------------------
+
+Safe, but requires:
+  - understanding TValue structure in specific game;
+  - confidence that changed constant is not used in other context.
+
+In BLEACH:
+  - k[14] and k[59] were float constants 0.01 and 0.0001.
+  - in memory Proto → TValue array (approximately 16 bytes/element).
+
+Runtime patch:
+  - by kPtr + idx * sizeof(TValue) read/write double.
+  - Frida code:
+
+    entry = kPtr.add(idx * 16);
+    oldVal = entry.readDouble();
+    entry.writeDouble(DAMAGE_MULT);
+
+Pros:
+  - we only change value, code remains same.
+
+Cons:
+  - if constant is used elsewhere (not only in damage formula),
+    that will also change.
+
+----------------------------------------------------------------------
+4.2. Patching Instruction Parameters (BLEACH Example)
+----------------------------------------------------------------------
+
+Goal:
+  - make MULK use different constant index,
+    without changing op or other arguments.
+
+Example:
+  - was MULK A=43 B=15 C=59 (k[59]=0.0001)
+  - became MULK A=43 B=15 C=14 (k[14]=0.01)
+
+Practically:
+  - via disasm for needed PC read word;
+  - construct new word with same op/A/B fields,
+    but different C;
+  - fix W26 word (in hex) as old/neu;
+  - apply via lua_patch_proto_w26.py and Frida.
+
+----------------------------------------------------------------------
+4.3. Patching op (Opcode)
+----------------------------------------------------------------------
+
+More aggressive variant:
+  - replace, say, limiting min/max
+    with something more "friendly";
+  - or comment out clamps (via NOP-like instruction).
+
+Requires:
+  - precise understanding of W26 opcode semantics;
+  - care not to break vital logic branch.
+
+======================================================================
+5. FRIDA LAYER: RUNTIME PATCH OF PROTO->CODE[] AND K[]
+======================================================================
+
+Idea:
+  - don't touch Lua Debug API, don't substitute closures;
+  - work directly with loaded Proto:
+      - intercept loadFunction(L, Proto*, sourceName);
+      - find needed Proto by (source, codeSize, constCount);
+      - patch Proto->code[pc] and/or Proto->k[idx] in memory.
+
+------------------------------------------------------------------------
+5.1. Hook loadFunction
+------------------------------------------------------------------------
+
+In BLEACH:
+  - loadFunction @ 0x5439C4 in libgame.so.
+
+Form:
+  loadFunction(SUndumpState *S, Proto *f, const char *psource);
+
+Frida hook:
+  - onEnter:
+      this.proto = args[1];
+      this.sourcePtr = args[2];
+      this.sourceName = readUtf8String or null.
+  - onLeave:
+      patchW26Instructions(this.proto, this.sourceName || "").
+
+------------------------------------------------------------------------
+5.2. Identifying Needed Proto
+------------------------------------------------------------------------
+
+Minimal criteria (as in BLEACH):
+  - code_size (nCode);
+  - const_count (nConst);
+  - (optionally) sourceName with substring (combat_api_damageFunc).
+
+Plus:
+  - check Pc/old words before patch.
+
+------------------------------------------------------------------------
+5.3. Example Patch Structure (BLEACH)
+------------------------------------------------------------------------
+
+W26_PATCH_SETS = [
+  {
+    chunkMatch: null,          // match only by codeSize/constCount
+    codeSize: 577,
+    constCount: 68,
+    protoTag: "P10",
+    patches: [
+      { pc: 461, old: 0x3B0F1598, neu: 0x0E0F1598 },
+      { pc: 546, old: 0x3B0F2298, neu: 0x0E0F2298 },
+    ],
+  },
+];
+
+Function patchW26Instructions:
+  - reads nCode, nConst, kPtr, codePtr from Proto;
+  - for each set compares current value and,
+    on old match, writes neu.
+
+======================================================================
+6. GAME UPDATES: TYPICAL BREAKAGE CASES AND HOW TO FIX
+======================================================================
+
+Very important section: you should be able to:
+  - distinguish situation "cheat just didn't work" from "game broke";
+  - by Frida logs quickly understand what exactly changed;
+  - restore W26 patches for new build.
+
+Let's consider typical scenarios.
+
+----------------------------------------------------------------------
+6.1. Scenario A: RVA Shifted in libgame.so
+----------------------------------------------------------------------
+
+Symptoms:
+  - Frida: "unable to find module 'libgame.so'" or hook on loadFunction gives no logs;
+  - or game crashes immediately after start if address is wrong.
+
+Diagnosis:
+  - open new libgame.so in IDA;
+  - find luaU_undump, loadFunction, luaV_execute again;
+  - fix new RVA.
+
+Fix:
+  - update in Frida script:
+      const loadFunctionRva = NEW_RVA;
+  - rest of code (patchW26Instructions) may not change,
+    if Proto format and bytecode remained same.
+
+----------------------------------------------------------------------
+6.2. Scenario B: Proto Format Changed
+----------------------------------------------------------------------
+
+Symptoms:
+  - lua_undump_proto.py stops parsing chunks:
+      - varint values insane, EOF, errors need N bytes at pos K;
+  - Frida log:
+      - "[W26] failed to read Proto fields"
+      - or inconsistent nCode/nConst.
+
+Diagnosis:
+  - re-disassemble loadFunction in new build:
+      - check order of varint/byte/block reads;
+      - possibly new service fields added between code and constants.
+
+Fix:
+  - update lua_undump_proto.py for new order;
+  - make sure that:
+      - parse_proto gives reasonable code_size/const_count;
+      - ProtoSummary is filled correctly.
+
+----------------------------------------------------------------------
+6.3. Scenario C: Order / Composition of Proto in Combat Chunks Changed
+----------------------------------------------------------------------
+
+Symptoms:
+  - lua_undump_proto shows:
+      - different list of P-indices and their sizes;
+      - e.g., P10 is no longer damage formula (different strings).
+
+Diagnosis:
+  - run lua_undump_proto and lua_disasm_from_proto again
+    on updated combat_api_damageFunc.lua.bin;
+  - by string_consts and disasm find new "formula" Proto:
+      - again orienting on DamageData, DamageRandom, CRITRATE_CONST, etc.
+
+Fix:
+  - update proto_index and possibly codeSize/constCount
+    in W26_PATCH_SETS structure;
+  - re-evaluate PC/old/neu (see scenario D).
+
+----------------------------------------------------------------------
+6.4. Scenario D: W26 Instructions Themselves Shifted / Changed
+----------------------------------------------------------------------
+
+Symptoms:
+  - Frida log:
+      - "[W26] hit Proto P10 ...", but:
+      - for patches:
+          "[W26] word mismatch, skip patch P10 pc=461 expected=0x..., got=0x..."
+  - game doesn't crash, but cheat gives no effect.
+
+Diagnosis:
+  - via lua_disasm_from_proto on new chunk:
+      - look at surroundings of old PC (461, 546, etc.);
+      - find where MULK/ADD/min/max with needed constants now stand;
+      - fix new PC and W26 words.
+
+Fix:
+  - update in W26_PATCH_SETS:
+      - pc;
+      - old (new real word);
+      - neu (analogous patch).
+  - if needed regenerate neu via small Python utility,
+    to avoid manual bit manipulation.
+
+----------------------------------------------------------------------
+6.5. Scenario E: Bytecode Integrity Checks Added
+----------------------------------------------------------------------
+
+More complex case:
+  - developers may add hash checks for Proto->code[];
+  - changing W26 words without updating hash may lead to:
+      - crash;
+      - battle/session reset.
+
+Symptoms:
+  - game crashes immediately after first battle where patch triggers;
+  - in logs/logcat strings like "chunk corrupted", "opcode check failed" are visible.
+
+Diagnosis:
+  - analysis of luaV_execute and neighboring functions:
+      - search for loops that:
+          - iteratively go through Proto->code;
+          - calculate some checksums/hashes;
+          - compare with additional fields in Proto.
+
+Fix:
+  - either:
+      - disable these checks (patch in VM, risky);
+  - or:
+      - learn to recalculate hash after our patches
+        and update stored value.
+
+In BLEACH at time of W26 branch explicit such checks were not present
+or they didn't interfere with W26/k[] level patches.
+
+======================================================================
+7. PORT TO OTHER GAMES
+======================================================================
+
+Generalized algorithm for new project:
+
+1) Check for Lua-VM presence:
+   - strings luaV_execute/luaU_undump;
+   - binary Lua chunks;
+   - combat code in Lua (by strings Damage/Hp/Combat).
+
+2) Implement minimal stack:
+   - chunk dumping (Frida hook luaL_loadbufferx/lua_load);
+   - lua_undump_proto (for specific loadFunction);
+   - bytecode disassembler (by luaV_execute).
+
+3) Find combat Proto:
+   - by strings: DamageData, Skill, HitInfo, HpDelta, RealDamage;
+   - by code/constant size.
+
+4) Locate damage formula:
+   - disasm sections with multiple arithmetic and crit/random constants;
+   - chain from DamageData to hitDamage/HpDelta.
+
+5) Design W26 patches:
+   - minimal changes: multipliers/clamps;
+   - offline verification via patcher by Proto+PC.
+
+6) Write and debug Frida script:
+   - hook loadFunction/analogous Proto loader;
+   - identify needed Proto by (source, codeSize, constCount, strings);
+   - apply list (P, PC, old, neu) and/or k[] patches.
+
+7) Prepare for updates:
+   - journal:
+       - addresses luaV_execute/loadFunction;
+       - codeSize/constCount of target Proto;
+       - PC/old/neu of W26 patches;
+   - on each update:
+       - check new build by scenarios from section 6;
+       - promptly update Proto parser, disasm and patch list.
+
+======================================================================
+8. DETAILED EXAMPLES OF W26 PATCHES (USING BLEACH EXAMPLE)
+======================================================================
+
+This section is intended so you can:
+  - without guesswork repeat entire path from disasm to specific W26 patch;
+  - understand how to carefully check `old` and construct `neu`;
+  - port pattern to other games with similar architecture.
+
+----------------------------------------------------------------------
+8.1. From Disasm to PC Selection
+----------------------------------------------------------------------
+
+Sequence of steps, already done in BLEACH, but in more algorithmic form:
+
+1) Proto Selection:
+   - by lua_undump_proto determine that P10 in combat_api_damageFunc:
+       - contains GetDamageFactor, DamageRandom, CRITRATE/FACTOR_CONST, GetAtk/GetDef, etc.;
+       - has code_size ≈ hundreds of instructions (577) and const_count ≈ tens (68).
+   - via lua_disasm_from_proto check general code structure and arithmetic activity zones.
+
+2) Locating Sections with 0.01 / 0.0001:
+   - via `--dump-consts` confirm that:
+       - k[14] = 0.01 (FLOAT);
+       - k[59] = 0.0001 (FLOAT).
+   - via `--op 24` (MULK) look at all MULK in P10:
+       - write down their PC and arguments A/B/C;
+       - select those with C == 59 (use k[59]).
+
+3) Analysis of Environment Around Selected PC:
+   - for each candidate (e.g., PC 461 and 546 in BLEACH):
+       - run disasm with `--range <PC-5>:<PC+5>`;
+       - confirm that:
+           · before MULK there's some normalization/sum of multipliers;
+           · after MULK result either goes further to ADD/MUL,
+             or already participates in final calculations.
+   - if around visible "clamp" (min/max) or crit block —
+     note this, but in simplest variant only touch MULK.
+
+----------------------------------------------------------------------
+8.2. Constructing New W26 Word
+----------------------------------------------------------------------
+
+Key idea:
+  - we are NOT required to "by bits" calculate new word — it can be taken
+    directly from offline disasm for another instruction with same fields.
+  - but useful to understand structure to verify ourselves.
+
+Steps:
+
+1) For selected PC (e.g., 461):
+   - write down original disasm line:
+       461: 0x3B0F1598  op=24(MULK)  A=43 F=0 B=15 C=59 ...
+   - confirm that:
+       - op=24 → MULK (by OP_NAMES);
+       - fields A/B/C correspond to expected registers/indices.
+
+2) Search in same Proto for similar MULK, but with C=14:
+   - via `--op 24` browse all MULK:
+       - find, say, line:
+           47: 0x0E0E0718  op=24(MULK) A=14 F=0 B=14 C=14 ...
+   - this gives us at least one example of "correct" word,
+     where C is already 14 (uses k[14]).
+
+3) Conceptually:
+   - we want to take current word and replace only field C (upper 8 bits).
+   - in BLEACH:
+       - C sits in bits 24–31, i.e. `C << 24`;
+       - all else equal:
+           neu = (old & 0x00FFFFFF) | (14 << 24).
+
+4) Practical approach (when no desire to manually mess with bits):
+   - can write small Python script based on lua_disasm_full:
+       - for selected PC reads word;
+       - extracts op/A/B/F/C;
+       - constructs new word with different C and prints it in hex.
+   - for BLEACH we, knowing format, could write manually:
+       - 0x3B0F1598 → 0x0E0F1598 (replace upper 8 bits from 0x3B to 0x0E);
+       - but in general case better rely on automation.
+
+----------------------------------------------------------------------
+8.3. Offline Verification of W26 Patch
+----------------------------------------------------------------------
+
+Goal: confirm that:
+  - `old` really matches what's in file;
+  - `neu` gives expected disasm;
+  - we don't go beyond file boundaries and don't break Proto structure.
+
+Order:
+
+1) Check `old`:
+   - before applying patch:
+       - run `lua_disasm_from_proto.py` with `--range` around PC;
+       - confirm that in output exactly:
+           PC: ... 0x3B0F1598 ...
+   - this value goes into `old` field.
+
+2) Apply patch via lua_patch_proto_w26.py:
+   - `python lua_patch_proto_w26.py bleach_lua_544_combat_api_damageFunc.lua.bin --set 10:461=0x0E0F1598`
+   - file `...damageFunc.lua.bin.patched.lua.bin` will appear.
+
+3) Repeat disasm:
+   - now disassemble already patched file:
+       - `python lua_disasm_from_proto.py bleach_lua_544_combat_api_damageFunc.lua.bin.patched.lua.bin --proto-index 10 --range 456:472`
+   - confirm that:
+       - at PC 461 now outputs:
+           461: 0x0E0F1598 op=24(MULK) A=43 F=0 B=15 C=14 ...
+       - rest of code around unchanged.
+
+4) If needed — repeat for all PC/patches.
+
+----------------------------------------------------------------------
+8.4. Porting Patches to Frida (Runtime)
+----------------------------------------------------------------------
+
+When offline part reliably worked,
+porting to runtime usually reduces to:
+
+1) Porting patch list:
+   - from lua_patch_proto_w26.py:
+       - `P:PC=0xWORD` (several items)
+   - to W26_PATCH_SETS structure in JS:
+       - `proto_index: P`;
+       - `pc: PC`;
+       - `old: 0xWORD_OLD`;
+       - `neu: 0xWORD_NEW`.
+
+2) Implementation of patchW26Instructions(proto, sourceName):
+   - as in BLEACH:
+       - read nCode/nConst/codePtr from Proto;
+       - check codeSize/constCount == expected;
+       - for each patch:
+           · calculate `insnPtr = codePtr.add(pc * 4)`;
+           · read cur = insnPtr.readU32();
+           · if cur == neu → already patched (possibly reload) → SKIP;
+           · if cur != old → log "word mismatch, skip";
+           · else → insnPtr.writeU32(neu).
+
+3) Hook on loadFunction:
+   - analogously to BLEACH:
+       - in onEnter save args[1] = Proto*, args[2] = const char *psource;
+       - in onLeave call patchW26Instructions(this.proto, this.sourceName||"").
+
+4) Safety measures:
+   - ALWAYS:
+       - check codeSize/constCount to not patch "similar" Proto;
+       - check old before writing neu.
+   - this is critical during game updates.
+
+======================================================================
+9. ONE-SIDED DAMAGE ("ONLY TO ENEMIES") — GENERAL APPROACH
+======================================================================
+
+In BLEACH we implemented "rough" multiplier that boosts damage overall.
+This section describes how theoretically to make
+multiplier apply only to hits on enemies, not on player.
+
+Important: described methodology relies on same principles,
+but will require separate mini-branch of reverse engineering when porting to another game.
+
+----------------------------------------------------------------------
+9.1. Where to Look for Side Information (attacker/target)
+----------------------------------------------------------------------
+
+In Lua layer usually there are functions/constants:
+  - GetEntityType, ENTITY_TYPE, HERO, MONSTER;
+  - GetCamp, IsHostility, IsFriend, IsSameCamp;
+  - GetOwnerUid / GetHeroType / HERO_TYPE / NORMAL, etc.
+
+In BLEACH:
+  - P10: contains strings "ENTITY_TYPE", "HERO", "MONSTER", "GetEntityType";
+  - P13: contains "IsHostility", "GetCamp", "GetOwnerUid", "HERO_TYPE", "NORMAL".
+
+Thanks to disasm visible that:
+  - in P13 when building/processing hitDamage there is access to:
+      - UID of attacker/target;
+      - hero/monster type;
+      - hostility information (IsHostility/GetCamp).
+
+In new game you should:
+  - search for similar strings/functions in combat Proto;
+  - disassemble around places of their usage.
+
+----------------------------------------------------------------------
+9.2. Conceptual Strategy
+----------------------------------------------------------------------
+
+Ideal plan:
+  1) Find place where **already** known:
+       - who is attacker;
+       - who is target;
+       - what "side" between them (hostile/ally/neutral).
+  2) Find section where final damage is calculated before writing to hitDamage/HpDelta.
+  3) Insert or change W26 instruction so that:
+       - if attacker is player (HERO) AND target is enemy (IsHostility == true) → damage *= HUGE_MULT;
+       - else → damage * 1 (original behavior).
+
+At that:
+  - we don't touch HP pipeline itself;
+  - don't change table/object structure;
+  - work only in formula at Lua bytecode level.
+
+----------------------------------------------------------------------
+9.3. Finding Suitable Branch Point in Bytecode
+----------------------------------------------------------------------
+
+Algorithm:
+
+1) In Proto (e.g., P13 for BLEACH):
+   - via `--dump-consts` confirm that there are:
+       - k[...] = "IsHostility", "GetCamp", "ENTITY_TYPE", "HERO", "MONSTER", "HERO_TYPE", "NORMAL".
+
+2) Via disasm (lua_disasm_from_proto):
+   - search for:
+       - GETFIELD/GETTABUP by these keys;
+       - CALL, after which TEST/TESTSET/JMP;
+       - comparison blocks EQ/EQI/GEI/LTI by HERO/MONSTER/HERO_TYPE, etc.
+
+3) Recover rough logic:
+   - by patterns like:
+       - LOADK/GETFIELD → function call → TEST/JMP;
+       - EQI/GEI/GTI → conditional branches.
+
+4) Goal:
+   - find branch:
+       if IsHostility(attacker, victim) then
+           ... (combat damage)
+       else
+           ... (may be other mode or just skip)
+       end
+   - or if GetCamp(...) ~= myCamp then ... end.
+
+When such branch is found:
+  - can insert/change MUL/MULK inside "true" branch,
+    leaving "false" branch untouched.
+
+----------------------------------------------------------------------
+9.4. Practical W26 Pattern for "Only Enemies"
+----------------------------------------------------------------------
+
+Consider simplified pseudocode:
+
+  if IsHostility(attacker, victim) then
+      damage = damage * HUGE_MULT
+  end
+
+In Lua bytecode (Lua 5.4-like VM) this usually turns into:
+
+  GETTABUP/GETFIELD k["IsHostility"]
+  ... prepare arguments ...
+  CALL
+  TEST/JMP (by result)
+  ... "true" branch body ...
+
+Our patch variants:
+
+1) Insert MULK directly in "true" branch:
+   - find register where damage lies at branch moment;
+   - add instruction MULK A=regDamage, B=regDamage, C=idxHuge,
+     using already existing constant slot (or patch k[]).
+
+2) If "true" branch already does something like:
+   - damage = damage * someFactor;
+   - can replace someFactor with HUGE_MULT,
+     carefully changing constant index (as in section 8.2).
+
+Difficulty:
+  - inserting new instruction changes code[] length,
+    requires relayout of lineinfo/jump targets;
+  - therefore preferable to search for already existing MUL/MULK
+    and change its parameters/constant.
+
+----------------------------------------------------------------------
+9.5. Limitations and Risks
+----------------------------------------------------------------------
+
+1) Need to be confident that:
+   - branch really distinguishes "player → enemy" from "enemy → player";
+   - there's no mirror reverse branch using same constants,
+     which you'll accidentally touch.
+
+2) Can't rely only on string names:
+   - "HERO"/"MONSTER"/"IsHostility" may be used in other places
+     (e.g., in AI/targeting logic);
+   - context is important: look where exactly this branch stands relative to
+     calculation/application of damage/hitDamage.
+
+3) Best approach:
+   - first implement rough multiplier (as in BLEACH);
+   - then, starting from already localized section,
+     gradually complicate patch to make it "one-sided".
+
+======================================================================
+10. TYPICAL ERRORS AND DEBUGGING
+======================================================================
+
+This section lists most frequent errors,
+that can be made when repeating branch,
+and ways to quickly diagnose and fix them.
+
+----------------------------------------------------------------------
+10.1. Nothing Happens (Damage Doesn't Change)
+----------------------------------------------------------------------
+
+Possible causes:
+
+1) Hook not active:
+   - Frida log doesn't contain strings:
+       "[W26] libgame.so base = ..."
+       "[W26] hit Proto ..."
+   - Check:
+       - that loadFunctionRva address is current for current build;
+       - that script is really loaded (run_frida_js printed "Script loaded").
+
+2) Proto didn't match:
+   - In logs no "[W26] hit Proto P10 ...", but there is "[W26] libgame.so base ...".
+   - Means, codeSize/constCount didn't match.
+   - Need to:
+       - re-run lua_undump_proto on new chunk;
+       - update codeSize/constCount in W26_PATCH_SETS.
+
+3) `old` didn't match:
+   - In logs:
+       "[W26] word mismatch, skip patch P10 pc=... expected=0x..., got=0x..."
+   - This means that:
+       - patch is calculated for old build;
+       - need to re-take disasm of P10 and update old/pc.
+
+----------------------------------------------------------------------
+10.2. Game Crashes Immediately After Patch
+----------------------------------------------------------------------
+
+Typical causes:
+
+1) Wrong RVA loadFunction:
+   - if hook is inserted in wrong place:
+       - Interceptor.attach on "not a function";
+       - or on function with different signature.
+   - Solution:
+       - via IDA re-check address;
+       - confirm that signature matches (S, Proto*, const char*).
+
+2) Memory corruption due to wrong kPtr/codePtr:
+   - if offsets in Proto changed, but script still
+     reads/writes at offset+56/64:
+       - write will hit foreign memory area → crash.
+   - Solution:
+       - by loadFunction re-take offsets of Proto fields;
+       - update getProtoInfo.
+
+3) Patch went beyond code[]:
+   - if pc >= nCode, but this is not checked →
+     insnPtr points beyond array → write to garbage.
+   - In BLEACH script check is provided,
+     it needs to always be preserved in new ports.
+
+----------------------------------------------------------------------
+10.3. "Visual Only" (HP Doesn't Change, Numbers Look Nice)
+----------------------------------------------------------------------
+
+Rare but possible scenario:
+  - if patch was attached not to damage formula,
+    but to visualization layer (UI/effects).
+
+Signs:
+  - UI damage numbers huge;
+  - HP bar/state of enemy/player correspond to stock.
+
+Diagnosis:
+  - by logs and disasm:
+      - check that changes were exactly in P10/P13
+        (formula core and hitDamage), not in some UI modules;
+      - confirm that HP change in damageSystem / HP pipeline
+        really depends on our fields.
+
+If this happened:
+  - means patch hit "upper" layer,
+    need to go deeper down Proto chain (as in BLEACH: P10→P13→P4→damageSystem).
+
+======================================================================
+END OF GUIDE (CURRENT VERSION)
+======================================================================
+
+When porting to new games you should:
+  - use this document as general plan / checklist;
+  - ALWAYS re-check:
+      · VM/loader addresses;
+      · Proto format and field offsets;
+      · sizes and contents of target Proto;
+      · relevance of PC/old/neu for each W26 patch.
+
+The methodology itself (Lua bytecode → Proto → disasm → W26 patches → Frida hooks)
+remains stable and portable, if game architecture really
+corresponds to described in sections 1–2.
+
+
+
+
