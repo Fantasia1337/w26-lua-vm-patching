@@ -1,5 +1,30 @@
 # W26 Lua VM Runtime Patching Toolkit
 
+> ⚠️ **DISCLAIMER & EDUCATIONAL PURPOSE**
+> 
+> This repository is intended **solely for educational and security research purposes**. The tools and techniques documented here are provided for learning about reverse engineering, dynamic instrumentation, and bytecode analysis methodologies.
+> 
+> **Important Notes:**
+> - This project demonstrates reverse engineering techniques for educational purposes
+> - Use of these tools may violate the Terms of Service of the target application
+> - The authors and contributors are not responsible for any misuse of this code
+> - This repository does not contain any copyrighted game assets, source code, or pirated content
+> - Users are responsible for ensuring their use complies with applicable laws and regulations
+> 
+> **Intended Use Cases:**
+> - Security research and vulnerability analysis
+> - Learning reverse engineering techniques
+> - Understanding virtual machine internals and bytecode structures
+> - Academic research on dynamic instrumentation
+> 
+> **By using this repository, you acknowledge that:**
+> - You understand the legal and ethical implications
+> - You will use this knowledge responsibly
+> - You accept full responsibility for your actions
+> - The authors bear no liability for any consequences
+
+---
+
 ## English version:
 
 These three files form a toolkit for runtime modification of the mobile game BLEACH: Soul Resonance (com.bleach.apj). The game runs on Android and uses a custom Lua VM implementation called W26 bytecode, which is embedded in the libgame.so library. This custom VM is similar to Lua 5.3/5.4 but uses a proprietary instruction format. The game's combat logic, including damage calculations, is implemented in Lua scripts that are compiled to W26 bytecode and stored in Proto structures. Each Proto contains bytecode instructions and a constants table. The main damage formula is located in Proto P10, which is loaded from the combat_api_damageFunc.lua module. Damage calculations use MULK (multiply by constant) instructions that reference float values from the constants table, specifically k[14] equals 0.01 and k[59] or k[60] equals 0.0001.
